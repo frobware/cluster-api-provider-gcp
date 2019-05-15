@@ -28,10 +28,10 @@ import (
 )
 
 const (
-	userDataSecretKey    = "userData"
-	operationTimeOut     = 180 * time.Second
-	operationRetryWait   = 5 * time.Second
 	credentialsSecretKey = "serviceAccountJSON"
+	operationRetryWait   = 5 * time.Second
+	operationTimeOut     = 180 * time.Second
+	userDataSecretKey    = "userData"
 )
 
 // Actuator is responsible for performing machine reconciliation.
@@ -63,11 +63,204 @@ func NewActuator(params ActuatorParams) *Actuator {
 	}
 }
 
-func waitUntilOperationCompleted(params *machineContext, operationName string) (*compute.Operation, error) {
+// Create creates a machine and is invoked by the machine controller.
+func (a *Actuator) Create(ctx context.Context, cluster *clusterv1.Cluster, machine *machinev1.Machine) error {
+	klog.Infof("Creating machine %q", machine.Name)
+
+	machineCtx, err := a.machineContext(machine)
+	if err != nil {
+		return err
+	}
+
+	instance := &compute.Instance{
+		CanIpForward:       machineCtx.providerSpec.CanIPForward,
+		DeletionProtection: machineCtx.providerSpec.DeletionProtection,
+		Labels:             machineCtx.providerSpec.Labels,
+		MachineType:        fmt.Sprintf("zones/%s/machineTypes/%s", machineCtx.providerSpec.Zone, machineCtx.providerSpec.MachineType),
+		Name:               machine.Name,
+		Tags: &compute.Tags{
+			Items: machineCtx.providerSpec.Tags,
+		},
+	}
+
+	var disks = []*compute.AttachedDisk{}
+	for _, disk := range machineCtx.providerSpec.Disks {
+		disks = append(disks, &compute.AttachedDisk{
+			AutoDelete: disk.AutoDelete,
+			Boot:       disk.Boot,
+			InitializeParams: &compute.AttachedDiskInitializeParams{
+				DiskSizeGb:  disk.SizeGb,
+				DiskType:    fmt.Sprintf("zones/%s/diskTypes/%s", machineCtx.providerSpec.Zone, disk.Type),
+				Labels:      disk.Labels,
+				SourceImage: disk.Image,
+			},
+		})
+	}
+	instance.Disks = disks
+
+	var networkInterfaces = []*compute.NetworkInterface{}
+	for _, nic := range machineCtx.providerSpec.NetworkInterfaces {
+		computeNIC := &compute.NetworkInterface{
+			AccessConfigs: []*compute.AccessConfig{{}},
+		}
+		if len(nic.Network) != 0 {
+			computeNIC.Network = fmt.Sprintf("projects/%s/global/networks/%s", machineCtx.projectID, nic.Network)
+		}
+		if len(nic.Subnetwork) != 0 {
+			computeNIC.Subnetwork = fmt.Sprintf("regions/%s/subnetworks/%s", machineCtx.providerSpec.Region, nic.Subnetwork)
+		}
+		networkInterfaces = append(networkInterfaces, computeNIC)
+	}
+	instance.NetworkInterfaces = networkInterfaces
+
+	var serviceAccounts = []*compute.ServiceAccount{}
+	for _, sa := range machineCtx.providerSpec.ServiceAccounts {
+		serviceAccounts = append(serviceAccounts, &compute.ServiceAccount{
+			Email:  sa.Email,
+			Scopes: sa.Scopes,
+		})
+	}
+	instance.ServiceAccounts = serviceAccounts
+
+	var metadataItems = []*compute.MetadataItems{{
+		Key:   "user-data",
+		Value: &machineCtx.userdata,
+	}}
+
+	for _, metadata := range machineCtx.providerSpec.Metadata {
+		metadataItems = append(metadataItems, &compute.MetadataItems{
+			Key:   metadata.Key,
+			Value: metadata.Value,
+		})
+	}
+
+	instance.Metadata = &compute.Metadata{
+		Items: metadataItems,
+	}
+
+	operation, err := machineCtx.computeService.InstancesInsert(machineCtx.projectID, machineCtx.providerSpec.Zone, instance)
+	if err != nil {
+		machineCtx.providerStatus.Conditions = reconcileProviderConditions(machineCtx.providerStatus.Conditions, v1beta1.GCPMachineProviderCondition{
+			Type:    v1beta1.MachineCreated,
+			Reason:  machineCreationFailedReason,
+			Message: err.Error(),
+			Status:  corev1.ConditionFalse,
+		})
+		if _, err := a.updateMachineStatus(machine, machineCtx.providerStatus); err != nil {
+			return err
+		}
+		return fmt.Errorf("failed to create instance via compute service: %v", err)
+	}
+
+	if op, err := waitUntilOperationCompleted(machineCtx, operation.Name); err != nil {
+		machineCtx.providerStatus.Conditions = reconcileProviderConditions(machineCtx.providerStatus.Conditions, v1beta1.GCPMachineProviderCondition{
+			Type:    v1beta1.MachineCreated,
+			Reason:  machineCreationFailedReason,
+			Message: err.Error(),
+			Status:  corev1.ConditionFalse,
+		})
+		if _, err := a.updateMachineStatus(machine, machineCtx.providerStatus); err != nil {
+			return err
+		}
+		return fmt.Errorf("failed to wait for create operation via compute service. Operation status: %v. Error: %v", op, err)
+	}
+
+	if _, err = a.updateMachineStatus(machine, machineCtx.providerStatus); err != nil {
+		return err
+	}
+
+	_, err = a.updateMachineSpec(machine, machineCtx.providerSpec)
+	return err
+}
+
+func (a *Actuator) Exists(ctx context.Context, cluster *clusterv1.Cluster, machine *machinev1.Machine) (bool, error) {
+	klog.Infof("Checking if machine %q exists", machine.Name)
+
+	machineCtx, err := a.machineContext(machine)
+	if err != nil {
+		return false, err
+	}
+
+	if err := a.validateProviderSpec(machineCtx.providerSpec); err != nil {
+		return false, fmt.Errorf("failed validating machine provider spec: %v", err)
+	}
+
+	// Need to verify that our project/zone exists before checking
+	// machine, as invalid project/zone produces same 404 error as
+	// no machine.
+	if err := validateZone(machineCtx); err != nil {
+		return false, fmt.Errorf("unable to verify project/zone exists: %v/%v; err: %v", machineCtx.projectID, machineCtx.providerSpec.Zone, err)
+	}
+
+	_, err = machineCtx.computeService.InstancesGet(machineCtx.projectID, machineCtx.providerSpec.Zone, machine.Name)
+	if err == nil {
+		klog.Infof("Machine %q already exists", machine.Name)
+		return true, nil
+	}
+
+	if isNotFoundError(err) {
+		klog.Infof("Machine %q does not exist", machine.Name)
+		return false, nil
+	}
+
+	return false, fmt.Errorf("error getting running instances: %v", err)
+}
+
+func (a *Actuator) Update(ctx context.Context, cluster *clusterv1.Cluster, machine *machinev1.Machine) error {
+	klog.Infof("Updating machine %q", machine.Name)
+
+	machineCtx, err := a.machineContext(machine)
+	if err != nil {
+		return err
+	}
+
+	if err := a.refreshMachineFromCloudState(machine, machineCtx); err != nil {
+		return err
+	}
+
+	if _, err = a.updateMachineStatus(machine, machineCtx.providerStatus); err != nil {
+		return err
+	}
+
+	_, err = a.updateMachineSpec(machine, machineCtx.providerSpec)
+	return err
+
+}
+
+func (a *Actuator) Delete(ctx context.Context, cluster *clusterv1.Cluster, machine *machinev1.Machine) error {
+	klog.Infof("Deleting machine %v", machine.Name)
+
+	machineCtx, err := a.machineContext(machine)
+	if err != nil {
+		return err
+	}
+
+	exists, err := a.Exists(ctx, cluster, machine)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		klog.Infof("Machine %v not found during delete, skipping", machine.Name)
+		return nil
+	}
+
+	operation, err := machineCtx.computeService.InstancesDelete(machineCtx.projectID, machineCtx.providerSpec.Zone, machine.Name)
+	if err != nil {
+		return fmt.Errorf("failed to delete instance via compute service: %v", err)
+	}
+
+	if op, err := waitUntilOperationCompleted(machineCtx, operation.Name); err != nil {
+		return fmt.Errorf("failed to wait for delete operation via compute service. Operation status: %v. Error: %v", op, err)
+	}
+
+	return nil
+}
+
+func waitUntilOperationCompleted(machineCtx *machineContext, operationName string) (*compute.Operation, error) {
 	var op *compute.Operation
 	var err error
 	return op, wait.Poll(operationRetryWait, operationTimeOut, func() (bool, error) {
-		op, err = params.computeService.ZoneOperationsGet(params.projectID, params.providerSpec.Zone, operationName)
+		op, err = machineCtx.computeService.ZoneOperationsGet(machineCtx.projectID, machineCtx.providerSpec.Zone, operationName)
 		if err != nil {
 			return false, err
 		}
@@ -86,8 +279,8 @@ func waitUntilOperationCompleted(params *machineContext, operationName string) (
 	})
 }
 
-func validateZone(params *machineContext) error {
-	_, err := params.computeService.ZonesGet(params.projectID, params.providerSpec.Zone)
+func validateZone(machineCtx *machineContext) error {
+	_, err := machineCtx.computeService.ZonesGet(machineCtx.projectID, machineCtx.providerSpec.Zone)
 	return err
 }
 
@@ -139,7 +332,7 @@ func createOauth2Client(serviceAccountJSON string, scope ...string) (*http.Clien
 	return oauth2.NewClient(ctx, jwt.TokenSource(ctx)), nil
 }
 
-func (a *Actuator) crudParametersFromMachine(machine *machinev1.Machine) (*machineContext, error) {
+func (a *Actuator) machineContext(machine *machinev1.Machine) (*machineContext, error) {
 	providerSpec, err := v1beta1.ProviderSpecFromRawExtension(machine.Spec.ProviderSpec.Value)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get machine config: %v", err)
@@ -170,7 +363,7 @@ func (a *Actuator) crudParametersFromMachine(machine *machinev1.Machine) (*machi
 		return nil, fmt.Errorf("error creating compute service: %v", err)
 	}
 
-	params := &machineContext{
+	machineCtx := &machineContext{
 		projectID: projectID,
 		// https://github.com/kubernetes/kubernetes/blob/8765fa2e48974e005ad16e65cb5c3acf5acff17b/staging/src/k8s.io/legacy-cloud-providers/gce/gce_util.go#L204
 		providerID:     fmt.Sprintf("gce://%s/%s/%s", projectID, providerSpec.Zone, machine.Name),
@@ -180,7 +373,7 @@ func (a *Actuator) crudParametersFromMachine(machine *machinev1.Machine) (*machi
 	}
 
 	if providerSpec.UserDataSecret == nil {
-		return params, nil
+		return machineCtx, nil
 	}
 
 	var userDataSecret corev1.Secret
@@ -199,8 +392,8 @@ func (a *Actuator) crudParametersFromMachine(machine *machinev1.Machine) (*machi
 		return nil, fmt.Errorf("secret %v/%v does not have %q field set. Thus, no user data applied when creating an instance", machine.GetNamespace(), providerSpec.UserDataSecret.Name, userDataSecretKey)
 	}
 
-	params.userdata = base64.StdEncoding.EncodeToString(data)
-	return params, nil
+	machineCtx.userdata = base64.StdEncoding.EncodeToString(data)
+	return machineCtx, nil
 }
 
 func (a *Actuator) updateMachineStatus(machine *machinev1.Machine, providerStatus *v1beta1.GCPMachineProviderStatus) (*machinev1.Machine, error) {
@@ -226,10 +419,10 @@ func (a *Actuator) updateMachineSpec(machine *machinev1.Machine, providerSpec *v
 	return a.machineClient.Machines(machine.Namespace).Update(machine)
 }
 
-func (a *Actuator) refreshMachineFromCloudState(machine *machinev1.Machine, params *machineContext) error {
+func (a *Actuator) refreshMachineFromCloudState(machine *machinev1.Machine, machineCtx *machineContext) error {
 	klog.Infof("Reconciling machine object %q with cloud state", machine.Name)
 
-	freshInstance, err := params.computeService.InstancesGet(params.projectID, params.providerSpec.Zone, machine.Name)
+	freshInstance, err := machineCtx.computeService.InstancesGet(machineCtx.projectID, machineCtx.providerSpec.Zone, machine.Name)
 	if err != nil {
 		return fmt.Errorf("failed to get instance via compute service: %v", err)
 	}
@@ -243,12 +436,12 @@ func (a *Actuator) refreshMachineFromCloudState(machine *machinev1.Machine, para
 		nodeAddresses = append(nodeAddresses, corev1.NodeAddress{Type: corev1.NodeExternalIP, Address: config.NatIP})
 	}
 
-	machine.Spec.ProviderID = &params.providerID
+	machine.Spec.ProviderID = &machineCtx.providerID
 	machine.Status.Addresses = nodeAddresses
 
-	params.providerStatus.InstanceState = &freshInstance.Status
-	params.providerStatus.InstanceID = &freshInstance.Name
-	params.providerStatus.Conditions = reconcileProviderConditions(params.providerStatus.Conditions, v1beta1.GCPMachineProviderCondition{
+	machineCtx.providerStatus.InstanceState = &freshInstance.Status
+	machineCtx.providerStatus.InstanceID = &freshInstance.Name
+	machineCtx.providerStatus.Conditions = reconcileProviderConditions(machineCtx.providerStatus.Conditions, v1beta1.GCPMachineProviderCondition{
 		Type:    v1beta1.MachineCreated,
 		Reason:  machineCreationSucceedReason,
 		Message: machineCreationSucceedMessage,
@@ -256,15 +449,6 @@ func (a *Actuator) refreshMachineFromCloudState(machine *machinev1.Machine, para
 	})
 
 	return nil
-}
-
-func isNotFoundError(err error) bool {
-	switch t := err.(type) {
-	case *googleapi.Error:
-		return t.Code == 404
-	default:
-		return false
-	}
 }
 
 func (a *Actuator) validateProviderSpec(providerSpec *v1beta1.GCPMachineProviderSpec) error {
@@ -275,195 +459,11 @@ func (a *Actuator) validateProviderSpec(providerSpec *v1beta1.GCPMachineProvider
 	return nil
 }
 
-// Create creates a machine and is invoked by the machine controller.
-func (a *Actuator) Create(ctx context.Context, cluster *clusterv1.Cluster, machine *machinev1.Machine) error {
-	klog.Infof("Creating machine %q", machine.Name)
-
-	params, err := a.crudParametersFromMachine(machine)
-	if err != nil {
-		return err
+func isNotFoundError(err error) bool {
+	switch t := err.(type) {
+	case *googleapi.Error:
+		return t.Code == 404
+	default:
+		return false
 	}
-
-	instance := &compute.Instance{
-		CanIpForward:       params.providerSpec.CanIPForward,
-		DeletionProtection: params.providerSpec.DeletionProtection,
-		Labels:             params.providerSpec.Labels,
-		MachineType:        fmt.Sprintf("zones/%s/machineTypes/%s", params.providerSpec.Zone, params.providerSpec.MachineType),
-		Name:               machine.Name,
-		Tags: &compute.Tags{
-			Items: params.providerSpec.Tags,
-		},
-	}
-
-	var disks = []*compute.AttachedDisk{}
-	for _, disk := range params.providerSpec.Disks {
-		disks = append(disks, &compute.AttachedDisk{
-			AutoDelete: disk.AutoDelete,
-			Boot:       disk.Boot,
-			InitializeParams: &compute.AttachedDiskInitializeParams{
-				DiskSizeGb:  disk.SizeGb,
-				DiskType:    fmt.Sprintf("zones/%s/diskTypes/%s", params.providerSpec.Zone, disk.Type),
-				Labels:      disk.Labels,
-				SourceImage: disk.Image,
-			},
-		})
-	}
-	instance.Disks = disks
-
-	var networkInterfaces = []*compute.NetworkInterface{}
-	for _, nic := range params.providerSpec.NetworkInterfaces {
-		computeNIC := &compute.NetworkInterface{
-			AccessConfigs: []*compute.AccessConfig{{}},
-		}
-		if len(nic.Network) != 0 {
-			computeNIC.Network = fmt.Sprintf("projects/%s/global/networks/%s", params.projectID, nic.Network)
-		}
-		if len(nic.Subnetwork) != 0 {
-			computeNIC.Subnetwork = fmt.Sprintf("regions/%s/subnetworks/%s", params.providerSpec.Region, nic.Subnetwork)
-		}
-		networkInterfaces = append(networkInterfaces, computeNIC)
-	}
-	instance.NetworkInterfaces = networkInterfaces
-
-	var serviceAccounts = []*compute.ServiceAccount{}
-	for _, sa := range params.providerSpec.ServiceAccounts {
-		serviceAccounts = append(serviceAccounts, &compute.ServiceAccount{
-			Email:  sa.Email,
-			Scopes: sa.Scopes,
-		})
-	}
-	instance.ServiceAccounts = serviceAccounts
-
-	var metadataItems = []*compute.MetadataItems{{
-		Key:   "user-data",
-		Value: &params.userdata,
-	}}
-
-	for _, metadata := range params.providerSpec.Metadata {
-		metadataItems = append(metadataItems, &compute.MetadataItems{
-			Key:   metadata.Key,
-			Value: metadata.Value,
-		})
-	}
-
-	instance.Metadata = &compute.Metadata{
-		Items: metadataItems,
-	}
-
-	operation, err := params.computeService.InstancesInsert(params.projectID, params.providerSpec.Zone, instance)
-	if err != nil {
-		params.providerStatus.Conditions = reconcileProviderConditions(params.providerStatus.Conditions, v1beta1.GCPMachineProviderCondition{
-			Type:    v1beta1.MachineCreated,
-			Reason:  machineCreationFailedReason,
-			Message: err.Error(),
-			Status:  corev1.ConditionFalse,
-		})
-		if _, err := a.updateMachineStatus(machine, params.providerStatus); err != nil {
-			return err
-		}
-		return fmt.Errorf("failed to create instance via compute service: %v", err)
-	}
-
-	if op, err := waitUntilOperationCompleted(params, operation.Name); err != nil {
-		params.providerStatus.Conditions = reconcileProviderConditions(params.providerStatus.Conditions, v1beta1.GCPMachineProviderCondition{
-			Type:    v1beta1.MachineCreated,
-			Reason:  machineCreationFailedReason,
-			Message: err.Error(),
-			Status:  corev1.ConditionFalse,
-		})
-		if _, err := a.updateMachineStatus(machine, params.providerStatus); err != nil {
-			return err
-		}
-		return fmt.Errorf("failed to wait for create operation via compute service. Operation status: %v. Error: %v", op, err)
-	}
-
-	if _, err = a.updateMachineStatus(machine, params.providerStatus); err != nil {
-		return err
-	}
-
-	_, err = a.updateMachineSpec(machine, params.providerSpec)
-	return err
-}
-
-func (a *Actuator) Exists(ctx context.Context, cluster *clusterv1.Cluster, machine *machinev1.Machine) (bool, error) {
-	klog.Infof("Checking if machine %q exists", machine.Name)
-
-	params, err := a.crudParametersFromMachine(machine)
-	if err != nil {
-		return false, err
-	}
-
-	if err := a.validateProviderSpec(params.providerSpec); err != nil {
-		return false, fmt.Errorf("failed validating machine provider spec: %v", err)
-	}
-
-	// Need to verify that our project/zone exists before checking
-	// machine, as invalid project/zone produces same 404 error as
-	// no machine.
-	if err := validateZone(params); err != nil {
-		return false, fmt.Errorf("unable to verify project/zone exists: %v/%v; err: %v", params.projectID, params.providerSpec.Zone, err)
-	}
-
-	_, err = params.computeService.InstancesGet(params.projectID, params.providerSpec.Zone, machine.Name)
-	if err == nil {
-		klog.Infof("Machine %q already exists", machine.Name)
-		return true, nil
-	}
-
-	if isNotFoundError(err) {
-		klog.Infof("Machine %q does not exist", machine.Name)
-		return false, nil
-	}
-
-	return false, fmt.Errorf("error getting running instances: %v", err)
-}
-
-func (a *Actuator) Update(ctx context.Context, cluster *clusterv1.Cluster, machine *machinev1.Machine) error {
-	klog.Infof("Updating machine %q", machine.Name)
-
-	params, err := a.crudParametersFromMachine(machine)
-	if err != nil {
-		return err
-	}
-
-	if err := a.refreshMachineFromCloudState(machine, params); err != nil {
-		return err
-	}
-
-	if _, err = a.updateMachineStatus(machine, params.providerStatus); err != nil {
-		return err
-	}
-
-	_, err = a.updateMachineSpec(machine, params.providerSpec)
-	return err
-
-}
-
-func (a *Actuator) Delete(ctx context.Context, cluster *clusterv1.Cluster, machine *machinev1.Machine) error {
-	klog.Infof("Deleting machine %v", machine.Name)
-
-	params, err := a.crudParametersFromMachine(machine)
-	if err != nil {
-		return err
-	}
-
-	exists, err := a.Exists(ctx, cluster, machine)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		klog.Infof("Machine %v not found during delete, skipping", machine.Name)
-		return nil
-	}
-
-	operation, err := params.computeService.InstancesDelete(params.projectID, params.providerSpec.Zone, machine.Name)
-	if err != nil {
-		return fmt.Errorf("failed to delete instance via compute service: %v", err)
-	}
-
-	if op, err := waitUntilOperationCompleted(params, operation.Name); err != nil {
-		return fmt.Errorf("failed to wait for delete operation via compute service. Operation status: %v. Error: %v", op, err)
-	}
-
-	return nil
 }
