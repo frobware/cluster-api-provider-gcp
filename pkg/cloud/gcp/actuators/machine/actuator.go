@@ -46,7 +46,7 @@ type ActuatorParams struct {
 	CoreClient    controllerclient.Client
 }
 
-type crudParams struct {
+type machineContext struct {
 	computeService computeservice.GCPComputeService
 	projectID      string
 	providerID     string
@@ -63,7 +63,7 @@ func NewActuator(params ActuatorParams) *Actuator {
 	}
 }
 
-func waitUntilOperationCompleted(params *crudParams, operationName string) (*compute.Operation, error) {
+func waitUntilOperationCompleted(params *machineContext, operationName string) (*compute.Operation, error) {
 	var op *compute.Operation
 	var err error
 	return op, wait.Poll(operationRetryWait, operationTimeOut, func() (bool, error) {
@@ -86,7 +86,7 @@ func waitUntilOperationCompleted(params *crudParams, operationName string) (*com
 	})
 }
 
-func validateZone(params *crudParams) error {
+func validateZone(params *machineContext) error {
 	_, err := params.computeService.ZonesGet(params.projectID, params.providerSpec.Zone)
 	return err
 }
@@ -139,7 +139,7 @@ func createOauth2Client(serviceAccountJSON string, scope ...string) (*http.Clien
 	return oauth2.NewClient(ctx, jwt.TokenSource(ctx)), nil
 }
 
-func (a *Actuator) crudParametersFromMachine(machine *machinev1.Machine) (*crudParams, error) {
+func (a *Actuator) crudParametersFromMachine(machine *machinev1.Machine) (*machineContext, error) {
 	providerSpec, err := v1beta1.ProviderSpecFromRawExtension(machine.Spec.ProviderSpec.Value)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get machine config: %v", err)
@@ -170,7 +170,7 @@ func (a *Actuator) crudParametersFromMachine(machine *machinev1.Machine) (*crudP
 		return nil, fmt.Errorf("error creating compute service: %v", err)
 	}
 
-	params := &crudParams{
+	params := &machineContext{
 		projectID: projectID,
 		// https://github.com/kubernetes/kubernetes/blob/8765fa2e48974e005ad16e65cb5c3acf5acff17b/staging/src/k8s.io/legacy-cloud-providers/gce/gce_util.go#L204
 		providerID:     fmt.Sprintf("gce://%s/%s/%s", projectID, providerSpec.Zone, machine.Name),
@@ -226,7 +226,7 @@ func (a *Actuator) updateMachineSpec(machine *machinev1.Machine, providerSpec *v
 	return a.machineClient.Machines(machine.Namespace).Update(machine)
 }
 
-func (a *Actuator) refreshMachineFromCloudState(machine *machinev1.Machine, params *crudParams) error {
+func (a *Actuator) refreshMachineFromCloudState(machine *machinev1.Machine, params *machineContext) error {
 	klog.Infof("Reconciling machine object %q with cloud state", machine.Name)
 
 	freshInstance, err := params.computeService.InstancesGet(params.projectID, params.providerSpec.Zone, machine.Name)
