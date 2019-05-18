@@ -3,18 +3,19 @@ package machine
 import (
 	"fmt"
 
+	machinev1 "github.com/openshift/cluster-api/pkg/apis/machine/v1beta1"
 	"github.com/pkg/errors"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 )
 
-func instanceFromMachineContext(machineCtx *machineContext, machineName string) *compute.Instance {
+func instanceFromMachineContext(machineCtx *machineContext, machine *machinev1.Machine) *compute.Instance {
 	instance := compute.Instance{
 		CanIpForward:       machineCtx.providerSpec.CanIPForward,
 		DeletionProtection: machineCtx.providerSpec.DeletionProtection,
 		Labels:             machineCtx.providerSpec.Labels,
 		MachineType:        fmt.Sprintf("zones/%s/machineTypes/%s", machineCtx.providerSpec.Zone, machineCtx.providerSpec.MachineType),
-		Name:               machineName,
+		Name:               machine.Name,
 		Tags: &compute.Tags{
 			Items: machineCtx.providerSpec.Tags,
 		},
@@ -78,7 +79,7 @@ func instanceFromMachineContext(machineCtx *machineContext, machineName string) 
 	return &instance
 }
 
-func instanceGet(machineCtx *machineContext, name string) (*compute.Instance, error) {
+func instanceGet(machineCtx *machineContext, machine *machinev1.Machine) (*compute.Instance, error) {
 	// Need to verify that our project/zone exists before checking
 	// for machine name, as invalid project/zone produces same 404
 	// error as no machine.
@@ -86,13 +87,13 @@ func instanceGet(machineCtx *machineContext, name string) (*compute.Instance, er
 		return nil, errors.Wrapf(err, "invalid zone %v", machineCtx.providerSpec.Zone)
 	}
 
-	instance, err := machineCtx.computeService.InstancesGet(machineCtx.projectID, machineCtx.providerSpec.Zone, name)
+	instance, err := machineCtx.computeService.InstancesGet(machineCtx.projectID, machineCtx.providerSpec.Zone, machine.Name)
 	if err != nil {
 		e, ok := err.(*googleapi.Error)
 		if ok && e.Code == 404 {
 			return nil, nil
 		}
-		return nil, errors.Wrapf(err, "InstanceGet failed for machine %q", name)
+		return nil, errors.Wrapf(err, "InstanceGet failed for machine %q", machine.Name)
 	}
 
 	return instance, nil

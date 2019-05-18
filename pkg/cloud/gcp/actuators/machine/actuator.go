@@ -16,8 +16,6 @@ import (
 	clustererror "github.com/openshift/cluster-api/pkg/controller/error"
 	compute "google.golang.org/api/compute/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/util/retry"
 	"k8s.io/klog"
 	controllerclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -60,7 +58,6 @@ func NewActuator(params ActuatorParams) *Actuator {
 	}
 }
 
-// Create creates a machine and is invoked by the machine controller.
 func (a *Actuator) Create(ctx context.Context, cluster *clusterv1.Cluster, machine *machinev1.Machine) error {
 	klog.Infof("Creating machine %q", machine.Name)
 
@@ -69,51 +66,23 @@ func (a *Actuator) Create(ctx context.Context, cluster *clusterv1.Cluster, machi
 		return err
 	}
 
-	instance, err := instanceGet(machineCtx, machine.Name)
+	instance, err := instanceGet(machineCtx, machine)
 	if err != nil {
 		return err
 	}
 
-	if instance == nil { // InstancesInsert is not idempotent
-		instance = instanceFromMachineContext(machineCtx, machine.Name)
-		operation, err := machineCtx.computeService.InstancesInsert(machineCtx.projectID, machineCtx.providerSpec.Zone, instance)
-		if err != nil {
-			return err
-		}
-		if instance == nil {
-			klog.Infof("Instance not created, returning an error to requeue")
-			return &clustererror.RequeueAfterError{RequeueAfter: requeuePeriod}
-		}
-		err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-			klog.Infof("Update Machine %q with create operation ID %v", machine.Name, operation.Id)
-			latestMachine, err := a.machineClient.Machines(machine.Namespace).Get(machine.Name, metav1.GetOptions{})
-			if err != nil {
-				return err
-			}
-			latestMachine.DeepCopyInto(machine)
-			if machine.Annotations == nil {
-				machine.Annotations = map[string]string{}
-			}
-			machine.Annotations[createOperationKey] = fmt.Sprintf("%v", operation.Id)
-			machine, err = a.machineClient.Machines(machine.Namespace).Update(machine)
-			return err
-		})
-		if err != nil {
-			return err
-		}
-		klog.Infof("Created instance %s/%s/%s. Operation id #%v", machineCtx.projectID, machineCtx.providerSpec.Zone, machine.Name, operation.Id)
-		return &clustererror.RequeueAfterError{RequeueAfter: requeuePeriod}
+	instance = instanceFromMachineContext(machineCtx, machine)
+	operation, err := machineCtx.computeService.InstancesInsert(string(machine.UID), machineCtx.projectID, machineCtx.providerSpec.Zone, instance)
+	if err != nil {
+		return err
 	}
 
-	klog.Infof("Creating machine %q, status: %s", machine.Name, instance.Status)
-
-	if val, ok := machine.Annotations[createOperationKey]; !ok || val == "" {
-		klog.Infof("machine has no create operation annotation, deleting instance and returning an error to requeue")
-		if _, err = machineCtx.computeService.InstancesDelete(machineCtx.projectID, machineCtx.providerSpec.Zone, machine.Name); err != nil {
-			return err
-		}
-		return &clustererror.RequeueAfterError{RequeueAfter: requeuePeriod}
+	if operation.Status != "DONE" {
+		klog.Infof("Operation ID: #%v not DONE for machine %q, returning an error to requeue", operation.Id, machine.Name)
+		return &clustererror.RequeueAfterError{RequeueAfter: 1 * time.Second}
 	}
+
+	klog.Infof("Instance %q (%s), status: %s", machine.Name, machine.UID, instance.Status)
 
 	if err := a.populateMachineWithInstanceState(machine, machineCtx, instance); err != nil {
 		return err
@@ -123,15 +92,12 @@ func (a *Actuator) Create(ctx context.Context, cluster *clusterv1.Cluster, machi
 		return err
 	}
 
-	op, err := machineCtx.computeService.ZoneOperationsGet(machineCtx.projectID, machineCtx.providerSpec.Zone, machine.Annotations[createOperationKey])
-	if err != nil {
-		return err
-	}
-
-	if op.Status != "DONE" {
+	if instance.Status != "RUNNING" {
 		klog.Infof("Instance state not running, returning an error to requeue")
 		return &clustererror.RequeueAfterError{RequeueAfter: requeuePeriod}
 	}
+
+	klog.Infof("Created machine %q, instance: %s/%s/%s", machineCtx.projectID, machineCtx.providerSpec.Zone, machine.Name)
 
 	return nil
 }
@@ -148,12 +114,11 @@ func (a *Actuator) Exists(ctx context.Context, cluster *clusterv1.Cluster, machi
 		return false, fmt.Errorf("failed validating machine provider spec: %v", err)
 	}
 
-	if val, ok := machine.Annotations[createOperationKey]; !ok || val == "" {
-		return false, nil
+	instance, err := instanceGet(machineCtx, machine)
+	if err != nil {
+		return false, fmt.Errorf("failed to get instance via compute service: %v", err)
 	}
-
-	op, _ := machineCtx.computeService.ZoneOperationsGet(machineCtx.projectID, machineCtx.providerSpec.Zone, machine.Annotations[createOperationKey])
-	return op != nil && op.Status == "DONE", nil
+	return instance != nil && instance.Status == "RUNNING", nil
 }
 
 func (a *Actuator) Update(ctx context.Context, cluster *clusterv1.Cluster, machine *machinev1.Machine) error {
@@ -164,7 +129,7 @@ func (a *Actuator) Update(ctx context.Context, cluster *clusterv1.Cluster, machi
 		return err
 	}
 
-	instance, err := instanceGet(machineCtx, machine.Name)
+	instance, err := instanceGet(machineCtx, machine)
 	if err != nil {
 		return fmt.Errorf("failed to get instance via compute service: %v", err)
 	}
@@ -192,14 +157,18 @@ func (a *Actuator) Delete(ctx context.Context, cluster *clusterv1.Cluster, machi
 		return err
 	}
 
-	instance, err := instanceGet(machineCtx, machine.Name)
+	instance, err := instanceGet(machineCtx, machine)
 	if err != nil || instance == nil {
 		klog.Infof("Machine %v not found during delete, skipping", machine.Name)
 		return nil
 	}
 
-	_, err = machineCtx.computeService.InstancesDelete(machineCtx.projectID, machineCtx.providerSpec.Zone, machine.Name)
-	return err
+	if _, err = machineCtx.computeService.InstancesDelete("a"+string(machine.UID), machineCtx.projectID, machineCtx.providerSpec.Zone, machine.Name); err != nil {
+		klog.Error(err)
+		panic(err)
+	}
+
+	return nil
 }
 
 func (a *Actuator) updateMachineStatus(machine *machinev1.Machine, providerStatus *v1beta1.GCPMachineProviderStatus) (*machinev1.Machine, error) {
